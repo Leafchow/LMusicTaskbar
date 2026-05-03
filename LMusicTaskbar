@@ -1,5 +1,5 @@
 // ==WindhawkMod==
-// @id              LMusicTaskbar
+// @id              lmusictb
 // @name            LMusicTaskbar
 // @description     Taskbar music controller
 // @version         1.0.0
@@ -131,7 +131,7 @@ struct ModSettings {
 
 HWND g_hMediaWindow = NULL;
 bool g_Running = true;
-int g_HoverState = 0; // 0=none 1=prev 2=play/pause 3=next 4=volume slider
+int g_HoverState = 0; // 0=none 1=prev 2=play/pause 3=next 4=volume slider 5=progress slider
 HWINEVENTHOOK g_TaskbarHook = nullptr;
 UINT g_TaskbarCreatedMsg = RegisterWindowMessage(L"TaskbarCreated");
 
@@ -143,14 +143,17 @@ struct MediaState {
     wstring artist = L"";
     bool isPlaying = false, hasMedia = false;
     Bitmap* albumArt = nullptr;
+    double position = 0.0, duration = 1.0;
     mutex lock;
 } g_MediaState;
 
 int g_ScrollOffset = 0, g_TextWidth = 0, g_ScrollWait = 60;
 bool g_IsScrolling = false;
 
+double g_CurrentProgress = 0.0;
 float g_CurrentVolume = 0.5f;
-bool g_IsDraggingSlider = false;
+bool g_IsDraggingVolumeSlider = false;
+bool g_IsDraggingProgressSlider = false;
 
 float GetSystemVolume() {
     IMMDeviceEnumerator* pEnum = nullptr;
@@ -204,6 +207,18 @@ SliderGeometry GetSliderGeometry(int height) {
     return sg;
 }
 
+SliderGeometry GetProgressSliderGeometry(int width, int height) {
+    double scale = g_Settings.buttonScale;
+    SliderGeometry vs = GetSliderGeometry(height);
+    float gap = 8.0f;
+    SliderGeometry sg;
+    sg.startX = vs.endX + gap;
+    sg.endX = (float)(width - 10);
+    sg.width = max(0.0f, sg.endX - sg.startX);
+    sg.y = vs.y;
+    return sg;
+}
+
 void LoadSettings() {
     g_Settings.width          = Wh_GetIntSetting(L"PanelWidth");
     g_Settings.height         = Wh_GetIntSetting(L"PanelHeight");
@@ -244,6 +259,16 @@ Bitmap* StreamToBitmap(IRandomAccessStreamWithContentType const& stream) {
     return nullptr;
 }
 
+wstring FormatTime(double seconds) {
+    if (seconds < 0.0) seconds = 0.0;
+    int total = (int)(seconds + 0.5);
+    int mins = total / 60;
+    int secs = total % 60;
+    wchar_t buf[16];
+    swprintf_s(buf, L"%d:%02d", mins, secs);
+    return buf;
+}
+
 void UpdateMediaInfo() {
     try {
         if (!g_SessionManager)
@@ -274,6 +299,14 @@ void UpdateMediaInfo() {
             g_MediaState.title     = newTitle;
             g_MediaState.artist    = props.Artist().c_str();
             g_MediaState.isPlaying = info.PlaybackStatus() == GlobalSystemMediaTransportControlsSessionPlaybackStatus::Playing;
+            try {
+                auto timeline = session.GetTimelineProperties();
+                g_MediaState.position = (double)timeline.Position().count() / 10000000.0;
+                g_MediaState.duration = max(1.0, (double)timeline.EndTime().count() / 10000000.0);
+            } catch (...) {
+                g_MediaState.position = 0.0;
+                g_MediaState.duration = 1.0;
+            }
             g_MediaState.hasMedia  = true;
         } else {
             lock_guard<mutex> guard(g_MediaState.lock);
@@ -352,6 +385,8 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
         state.albumArt  = g_MediaState.albumArt ? g_MediaState.albumArt->Clone() : nullptr;
         state.hasMedia  = g_MediaState.hasMedia;
         state.isPlaying = g_MediaState.isPlaying;
+        state.position  = g_MediaState.position;
+        state.duration  = max(1.0, g_MediaState.duration);
     }
 
     // Album art
@@ -371,7 +406,7 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
     // Media controls
     double scale = g_Settings.buttonScale;
     int scx = 6 + artSize + (int)(12 * scale);
-    int controlY = height / 2 - 5;
+    int controlY = height / 2 - 8;
 
     SolidBrush iconBrush{ mc };
     SolidBrush hoverBrush{ Color(255, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
@@ -423,7 +458,7 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
 
     Region textClip(Rect(textX, 0, textMaxW, height));
     g.SetClip(&textClip);
-    float textY = (height - boundRect.Height) / 2.0f - 4.0f;
+    float textY = 6.0f;
 
     if (g_TextWidth > textMaxW) {
         g_IsScrolling = true;
@@ -438,34 +473,63 @@ void DrawMediaPanel(HDC hdc, int width, int height) {
     }
     g.ResetClip();
 
-    // Volume slider
+    // Timer and volume percentage above the sliders
+    double displayPosition = g_IsDraggingProgressSlider ? (g_CurrentProgress * state.duration) : state.position;
+    wstring timerText = FormatTime(displayPosition) + L" / " + FormatTime(state.duration);
+    wchar_t volBuf[16];
+    swprintf_s(volBuf, L"%d%%", (int)(g_CurrentVolume * 100.0f + 0.5f));
+    wstring volumeText = volBuf;
+    Font timerFont(&ff, (REAL)max(8, g_Settings.fontSize - 2), FontStyleBold, UnitPixel);
+    RectF timerBounds;
+    g.MeasureString(timerText.c_str(), -1, &timerFont, RectF(0,0,200,50), &timerBounds);
+    RectF volBounds;
+    g.MeasureString(volumeText.c_str(), -1, &timerFont, RectF(0,0,200,50), &volBounds);
+    SliderGeometry pg = GetProgressSliderGeometry(width, height);
     SliderGeometry sg = GetSliderGeometry(height);
+    float timerY = textY + boundRect.Height + 3.5f;
+    g.DrawString(timerText.c_str(), -1, &timerFont, PointF(pg.startX, timerY), &textBrush);
+    float volX = max(sg.startX, sg.startX + sg.width - volBounds.Width);
+    g.DrawString(volumeText.c_str(), -1, &timerFont, PointF(volX, timerY), &textBrush);
+
+    // Progress slider on the same line as the volume slider
+    float progressFill = (float)(g_CurrentProgress * pg.width);
+    {
+        SolidBrush trackBg{ Color(40, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
+        GraphicsPath tp;
+        AddRoundedRect(tp, (int)pg.startX, (int)(pg.y - 1.5f), (int)pg.width, 3, 1);
+        g.FillPath(&trackBg, &tp);
+    }
+    if (progressFill > 1.0f) {
+        SolidBrush fill{ Color(200, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
+        GraphicsPath fp;
+        AddRoundedRect(fp, (int)pg.startX, (int)(pg.y - 1.5f), (int)progressFill, 3, 1);
+        g.FillPath(&fill, &fp);
+    }
+
+    // Volume slider with icon on the right
+    sg = GetSliderGeometry(height);
     float trackH = 3.0f;
     float thumbR = 5.0f * (float)scale;
     float thumbX = sg.startX + g_CurrentVolume * sg.width;
-    bool  hov    = (g_HoverState == 4 || g_IsDraggingSlider);
-
+    bool hovVolume = (g_HoverState == 4 || g_IsDraggingVolumeSlider);
     {
         SolidBrush trackBg{ Color(55, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
-        int tw = (int)sg.width, th = (int)trackH;
-        if (tw > 0 && th > 0) {
-            GraphicsPath tp;
-            AddRoundedRect(tp, (int)sg.startX, (int)(sg.y - trackH/2), tw, th, 1);
-            g.FillPath(&trackBg, &tp);
-        }
+        GraphicsPath tp;
+        AddRoundedRect(tp, (int)sg.startX, (int)(sg.y - trackH/2), (int)sg.width, (int)trackH, 1);
+        g.FillPath(&trackBg, &tp);
     }
     {
-        int fw = (int)(g_CurrentVolume * sg.width);
-        if (fw > 1) {
+        float fw = g_CurrentVolume * sg.width;
+        if (fw > 1.0f) {
             SolidBrush fill{ Color(200, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
             GraphicsPath fp;
-            AddRoundedRect(fp, (int)sg.startX, (int)(sg.y - trackH/2), fw, (int)trackH, 1);
+            AddRoundedRect(fp, (int)sg.startX, (int)(sg.y - trackH/2), (int)fw, (int)trackH, 1);
             g.FillPath(&fill, &fp);
         }
     }
     {
-        float tr = hov ? thumbR * 1.25f : thumbR;
-        SolidBrush thumb{ Color(hov ? 255 : 180, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
+        float tr = hovVolume ? thumbR * 1.25f : thumbR;
+        SolidBrush thumb{ Color(hovVolume ? 255 : 180, mc.GetRed(), mc.GetGreen(), mc.GetBlue()) };
         g.FillEllipse(&thumb, thumbX - tr, sg.y - tr, tr * 2.0f, tr * 2.0f);
     }
 }
@@ -527,7 +591,13 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
         case WM_TIMER:
             if (wParam == IDT_POLL_MEDIA) {
                 UpdateMediaInfo();
-                if (!g_IsDraggingSlider) g_CurrentVolume = GetSystemVolume();
+                if (!g_IsDraggingVolumeSlider) g_CurrentVolume = GetSystemVolume();
+                if (!g_IsDraggingProgressSlider) {
+                    lock_guard<mutex> guard(g_MediaState.lock);
+                    if (g_MediaState.duration > 0.0) {
+                        g_CurrentProgress = max(0.0, min(1.0, g_MediaState.position / g_MediaState.duration));
+                    }
+                }
 
                 bool shouldHide = false;
                 if (g_Settings.hideFullscreen) {
@@ -594,25 +664,42 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
 
         case WM_LBUTTONDOWN: {
             int mx = (int)(short)LOWORD(lParam), my = (int)(short)HIWORD(lParam);
-            SliderGeometry sg = GetSliderGeometry(g_Settings.height);
-            if (my >= sg.y-8 && my <= sg.y+8 && mx >= sg.startX && mx <= sg.endX) {
-                g_IsDraggingSlider = true;
+            SliderGeometry vsg = GetSliderGeometry(g_Settings.height);
+            float progressY = (float)g_Settings.height - 18.0f;
+            if (my >= vsg.y-8 && my <= vsg.y+8 && mx >= vsg.startX && mx <= vsg.endX) {
+                g_IsDraggingVolumeSlider = true;
                 SetCapture(hwnd);
-                float vol = max(0.0f, min(1.0f, (mx - sg.startX) / sg.width));
+                float vol = max(0.0f, min(1.0f, (mx - vsg.startX) / vsg.width));
                 g_CurrentVolume = vol;
                 SetSystemVolume(vol);
                 InvalidateRect(hwnd, NULL, FALSE);
+            } else if (my >= progressY - 8 && my <= progressY + 8) {
+                SliderGeometry pg = GetProgressSliderGeometry(g_Settings.width, g_Settings.height);
+                if (mx >= pg.startX && mx <= pg.endX) {
+                    g_IsDraggingProgressSlider = true;
+                    SetCapture(hwnd);
+                    double progress = (double)(mx - pg.startX) / (double)pg.width;
+                    g_CurrentProgress = max(0.0, min(1.0, progress));
+                    InvalidateRect(hwnd, NULL, FALSE);
+                }
             }
             return 0;
         }
 
         case WM_MOUSEMOVE: {
             int mx = (int)(short)LOWORD(lParam), my = (int)(short)HIWORD(lParam);
-            if (g_IsDraggingSlider) {
+            if (g_IsDraggingVolumeSlider) {
                 SliderGeometry sg = GetSliderGeometry(g_Settings.height);
                 float vol = max(0.0f, min(1.0f, (mx - sg.startX) / sg.width));
                 g_CurrentVolume = vol;
                 SetSystemVolume(vol);
+                InvalidateRect(hwnd, NULL, FALSE);
+                return 0;
+            }
+            if (g_IsDraggingProgressSlider) {
+                SliderGeometry pg = GetProgressSliderGeometry(g_Settings.width, g_Settings.height);
+                double progress = (double)(mx - pg.startX) / (double)pg.width;
+                g_CurrentProgress = max(0.0, min(1.0, progress));
                 InvalidateRect(hwnd, NULL, FALSE);
                 return 0;
             }
@@ -623,10 +710,14 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             float gap = 28.0f*(float)scale, cr = 12.0f*(float)scale;
             float pX = (float)startCX, plX = pX+gap, nX = plX+gap;
             SliderGeometry sg = GetSliderGeometry(g_Settings.height);
+            SliderGeometry pg = GetProgressSliderGeometry(g_Settings.width, g_Settings.height);
+            float progressY = (float)g_Settings.height - 18.0f;
 
             int newState = 0;
             if (my >= sg.y-8 && my <= sg.y+8 && mx >= sg.startX && mx <= sg.endX)
                 newState = 4;
+            else if (my >= progressY-8 && my <= progressY+8 && mx >= pg.startX && mx <= pg.endX)
+                newState = 5;
             else if (my > 4 && my < g_Settings.height - 16) {
                 if      (mx >= pX -cr && mx <= pX +cr) newState = 1;
                 else if (mx >= plX-cr && mx <= plX+cr) newState = 2;
@@ -645,8 +736,26 @@ LRESULT CALLBACK MediaWndProc(HWND hwnd, UINT msg, WPARAM wParam, LPARAM lParam)
             break;
 
         case WM_LBUTTONUP:
-            if (g_IsDraggingSlider) { g_IsDraggingSlider = false; ReleaseCapture(); }
-            else if (g_HoverState > 0 && g_HoverState < 4) SendMediaCommand(g_HoverState);
+            if (g_IsDraggingVolumeSlider) {
+                g_IsDraggingVolumeSlider = false;
+                ReleaseCapture();
+            } else if (g_IsDraggingProgressSlider) {
+                g_IsDraggingProgressSlider = false;
+                ReleaseCapture();
+                try {
+                    if (g_SessionManager) {
+                        auto session = g_SessionManager.GetCurrentSession();
+                        if (session) {
+                            lock_guard<mutex> guard(g_MediaState.lock);
+                            double duration = max(1.0, g_MediaState.duration);
+                            int64_t ticks = (int64_t)(g_CurrentProgress * duration * 10000000.0);
+                            session.TryChangePlaybackPositionAsync(ticks).get();
+                        }
+                    }
+                } catch (...) {}
+            } else if (g_HoverState > 0 && g_HoverState < 4) {
+                SendMediaCommand(g_HoverState);
+            }
             return 0;
 
         case WM_MOUSEWHEEL: {
